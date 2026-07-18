@@ -1,0 +1,15 @@
+{
+  "_说明": "自选股列表和异常检测阈值。价格变化后下次轮询生效，无需重启。",
+  "watchlist": [
+    "601138"
+  ],
+  "thresholds": {
+    "price_change_pct": 3.0,
+    "volume_ratio": 2.5,
+    "turnover_rate": 5.0,
+    "amplitude": 6.0,
+    "near_limit_up": 9.0,
+    "near_limit_down": -9.0
+  },
+  "poll_interval_minutes": 1
+}
