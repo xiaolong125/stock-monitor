@@ -119,12 +119,15 @@ def fetch_all_stocks(codes: list[str]) -> dict[str, dict]:
         high = num(fields[4])
         low = num(fields[5])
 
+        # 非交易日或停牌时，API 返回价格为 0，标记为无效数据
+        data_valid = price is not None and price > 0
+
         change_pct = None
-        if price is not None and prev_close is not None and prev_close != 0:
+        if data_valid and prev_close is not None and prev_close != 0:
             change_pct = (price - prev_close) / prev_close * 100
 
         amplitude = None
-        if high is not None and low is not None and prev_close is not None and prev_close != 0:
+        if data_valid and high is not None and low is not None and prev_close is not None and prev_close != 0:
             amplitude = (high - low) / prev_close * 100
 
         # 解析数据时间戳，用于判断数据新鲜度
@@ -139,6 +142,7 @@ def fetch_all_stocks(codes: list[str]) -> dict[str, dict]:
         data = {
             "_code": code,
             "_name": fields[0],
+            "_valid": data_valid,
             "price": price,
             "prev_close": prev_close,
             "open": num(fields[1]),
@@ -158,7 +162,10 @@ def fetch_all_stocks(codes: list[str]) -> dict[str, dict]:
 
 
 def detect_anomalies(data: dict, thresholds: dict) -> list[str]:
-    """检测单只股票的异常，返回异常描述列表。"""
+    """检测单只股票的异常，返回异常描述列表。无效数据直接返回空。"""
+    if not data.get("_valid"):
+        return []
+
     alerts = []
     code = data["_code"]
     name = data["_name"]
@@ -206,6 +213,11 @@ def format_stock_line(data: dict) -> str:
     """格式化单只股票为一行的显示字符串。"""
     name = data.get("_name", "???")
     code = data["_code"]
+
+    if not data.get("_valid"):
+        prev_close = data.get("prev_close") or 0
+        return f"  {name:8s} {code:6s}  {'—':>8s}  停牌/未开盘  昨收:{prev_close:.2f}"
+
     price = data.get("price") or 0
     change_pct = data.get("change_pct") or 0
     direction = "↑" if (change_pct or 0) > 0 else "↓" if (change_pct or 0) < 0 else "→"
