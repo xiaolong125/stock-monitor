@@ -2,15 +2,11 @@
 """A股盯盘工具 - 纯标准库实现，通过新浪行情API获取实时数据。
 
 自动判断北京时间交易时段，非交易时段只展示数据不弹窗。
+振幅等累积指标只在创新高时提醒，避免重复噪音。
 
 用法:
     python3 stock_monitor.py              # 单次检查
     python3 stock_monitor.py --test       # 测试通知是否正常
-
-新浪行情 API 字段 (按逗号分隔):
-    [0]  名称      [1]  今开      [2]  昨收      [3]  当前价
-    [4]  最高      [5]  最低      [8]  成交量(股)  [9]  成交额(元)
-    [30] 日期      [31] 时间
 """
 
 import json
@@ -18,18 +14,15 @@ import os
 import re
 import subprocess
 import sys
-import time
 import urllib.request
 from datetime import datetime, timezone, timedelta
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 CONFIG_PATH = os.path.join(SCRIPT_DIR, "config.json")
+STATE_PATH = os.path.join(SCRIPT_DIR, "state.json")  # 当日状态（振幅峰值等）
 
-# 新浪实时行情 API（可批量查询）
 SINA_URL = "http://hq.sinajs.cn/list={codes}"
 SINA_HEADERS = {"Referer": "https://finance.sina.com.cn"}
-
-# 北京时间 (UTC+8)
 BEIJING_TZ = timezone(timedelta(hours=8))
 
 
@@ -38,28 +31,37 @@ def load_config():
         return json.load(f)
 
 
+def load_state() -> dict:
+    """加载当日状态，跨天自动重置。"""
+    try:
+        with open(STATE_PATH, "r", encoding="utf-8") as f:
+            state = json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        state = {}
+
+    today = beijing_now().strftime("%Y-%m-%d")
+    if state.get("date") != today:
+        state = {"date": today, "stocks": {}}
+    return state
+
+
+def save_state(state: dict):
+    """保存当日状态。"""
+    with open(STATE_PATH, "w", encoding="utf-8") as f:
+        json.dump(state, f, ensure_ascii=False, indent=2)
+
+
 def beijing_now() -> datetime:
-    """返回当前北京时间。"""
     return datetime.now(timezone.utc).astimezone(BEIJING_TZ)
 
 
 def is_trading_time(dt: datetime | None = None) -> tuple[bool, str]:
-    """判断当前是否为 A 股交易时段（北京时间周一至五 9:30-11:30, 13:00-15:00）。
-
-    Returns:
-        (is_trading, status_text) — 是否交易中 + 状态说明
-    """
     if dt is None:
         dt = beijing_now()
-
-    weekday = dt.weekday()  # 0=周一, 6=周日
-    hour = dt.hour
-    minute = dt.minute
-    t = hour * 60 + minute  # 当天分钟数
-
+    weekday = dt.weekday()
+    t = dt.hour * 60 + dt.minute
     if weekday >= 5:
         return False, "周末休市" if weekday == 5 else "周日休市"
-
     if 9 * 60 + 30 <= t < 11 * 60 + 30:
         return True, "早盘交易中"
     elif 11 * 60 + 30 <= t < 13 * 60:
@@ -73,15 +75,10 @@ def is_trading_time(dt: datetime | None = None) -> tuple[bool, str]:
 
 
 def code_to_sina_symbol(code: str) -> str:
-    """将 6 位代码转为新浪接口前缀: 60xxxx→sh, 00/30xxxx→sz"""
-    if code.startswith(("60", "68")):
-        return f"sh{code}"
-    else:
-        return f"sz{code}"
+    return f"sh{code}" if code.startswith(("60", "68")) else f"sz{code}"
 
 
 def fetch_all_stocks(codes: list[str]) -> dict[str, dict]:
-    """批量获取多只股票实时数据，返回 {code: data} 字典。"""
     symbols = [code_to_sina_symbol(c) for c in codes]
     url = SINA_URL.format(codes=",".join(symbols))
     try:
@@ -103,7 +100,6 @@ def fetch_all_stocks(codes: list[str]) -> dict[str, dict]:
         fields = payload.split(",")
         if len(fields) < 32:
             continue
-
         code = symbol[2:]
 
         def num(s: str) -> float | None:
@@ -118,8 +114,6 @@ def fetch_all_stocks(codes: list[str]) -> dict[str, dict]:
         prev_close = num(fields[2])
         high = num(fields[4])
         low = num(fields[5])
-
-        # 非交易日或停牌时，API 返回价格为 0，标记为无效数据
         data_valid = price is not None and price > 0
 
         change_pct = None
@@ -130,7 +124,6 @@ def fetch_all_stocks(codes: list[str]) -> dict[str, dict]:
         if data_valid and high is not None and low is not None and prev_close is not None and prev_close != 0:
             amplitude = (high - low) / prev_close * 100
 
-        # 解析数据时间戳，用于判断数据新鲜度
         data_dt = None
         try:
             data_dt = datetime.strptime(
@@ -139,7 +132,7 @@ def fetch_all_stocks(codes: list[str]) -> dict[str, dict]:
         except (ValueError, IndexError):
             pass
 
-        data = {
+        results[code] = {
             "_code": code,
             "_name": fields[0],
             "_valid": data_valid,
@@ -152,17 +145,13 @@ def fetch_all_stocks(codes: list[str]) -> dict[str, dict]:
             "amount": num(fields[9]),
             "change_pct": change_pct,
             "amplitude": amplitude,
-            "turnover_rate": None,
-            "volume_ratio": None,
             "data_time": data_dt,
         }
-        results[code] = data
-
     return results
 
 
-def detect_anomalies(data: dict, thresholds: dict) -> list[str]:
-    """检测单只股票的异常，返回异常描述列表。无效数据直接返回空。"""
+def detect_anomalies(data: dict, thresholds: dict, state: dict) -> list[str]:
+    """检测异常，振幅等累积指标只在新高时提醒。"""
     if not data.get("_valid"):
         return []
 
@@ -173,25 +162,44 @@ def detect_anomalies(data: dict, thresholds: dict) -> list[str]:
     change_pct = data.get("change_pct")
     amplitude = data.get("amplitude")
 
+    # 确保当天状态中有该股票
+    if code not in state["stocks"]:
+        state["stocks"][code] = {}
+    stock_state = state["stocks"][code]
+
     if change_pct is not None and change_pct != 0:
         limit_up = thresholds.get("near_limit_up", 9.0)
         limit_down = thresholds.get("near_limit_down", -9.0)
+
+        # 涨跌停：始终提醒
         if change_pct >= limit_up:
             alerts.append(f"🚀 {name}({code}) 涨停 +{change_pct:.2f}% 现价{price:.2f}")
         elif change_pct <= limit_down:
             alerts.append(f"🔻 {name}({code}) 跌停 {change_pct:.2f}% 现价{price:.2f}")
         elif abs(change_pct) >= thresholds.get("price_change_pct", 3.0):
-            direction = "大涨" if change_pct > 0 else "大跌"
-            alerts.append(f"⚠️ {name}({code}) {direction} {change_pct:+.2f}% 现价{price:.2f}")
+            # 大涨大跌：方向变了或重新进入才报
+            direction = "up" if change_pct > 0 else "down"
+            prev_direction = stock_state.get("last_alert_direction")
+            if prev_direction != direction:
+                label = "大涨" if direction == "up" else "大跌"
+                alerts.append(f"⚠️ {name}({code}) {label} {change_pct:+.2f}% 现价{price:.2f}")
+                stock_state["last_alert_direction"] = direction
+        else:
+            # 回到阈值以下，重置方向记录
+            if "last_alert_direction" in stock_state:
+                del stock_state["last_alert_direction"]
 
+    # 振幅：只在创新高时提醒
     if amplitude is not None and amplitude >= thresholds.get("amplitude", 6.0):
-        alerts.append(f"📈 {name}({code}) 振幅 {amplitude:.2f}%")
+        prev_max = stock_state.get("max_amplitude", 0)
+        if amplitude > prev_max + 0.01:  # 0.01 容差避免浮点抖动
+            alerts.append(f"📈 {name}({code}) 振幅新高 {amplitude:.2f}%")
+            stock_state["max_amplitude"] = amplitude
 
     return alerts
 
 
 def send_notification(title: str, body: str, sound: str = "Glass"):
-    """发送 macOS 系统通知。"""
     safe_title = title.replace('"', '\\"').replace("\\", "\\\\")
     safe_body = body.replace('"', '\\"').replace("\\", "\\\\")
     script = (
@@ -200,20 +208,14 @@ def send_notification(title: str, body: str, sound: str = "Glass"):
         f' sound name "{sound}"'
     )
     try:
-        subprocess.run(
-            ["osascript", "-e", script],
-            capture_output=True,
-            timeout=5,
-        )
+        subprocess.run(["osascript", "-e", script], capture_output=True, timeout=5)
     except Exception as e:
         print(f"  通知发送失败: {e}", file=sys.stderr)
 
 
 def format_stock_line(data: dict) -> str:
-    """格式化单只股票为一行的显示字符串。"""
     name = data.get("_name", "???")
     code = data["_code"]
-
     if not data.get("_valid"):
         prev_close = data.get("prev_close") or 0
         return f"  {name:8s} {code:6s}  {'—':>8s}  停牌/未开盘  昨收:{prev_close:.2f}"
@@ -234,15 +236,11 @@ def format_stock_line(data: dict) -> str:
 
 
 def run_once(config: dict, notify: bool = True, force_notify: bool = False):
-    """执行一次检查，返回所有异常描述列表。
-
-    notify=False 时完全不发通知。
-    force_notify=True 时忽略交易时段判断，强制发通知。
-    """
     watchlist = config["watchlist"]
     thresholds = config["thresholds"]
     bj_now = beijing_now()
     trading, status = is_trading_time(bj_now)
+    state = load_state()
 
     print(f"\n{'='*60}")
     print(f"  A股盯盘")
@@ -258,8 +256,10 @@ def run_once(config: dict, notify: bool = True, force_notify: bool = False):
             print(f"  [{code}] 无数据")
             continue
         print(format_stock_line(data))
-        alerts = detect_anomalies(data, thresholds)
+        alerts = detect_anomalies(data, thresholds, state)
         all_alerts.extend(alerts)
+
+    save_state(state)
 
     if all_alerts:
         print(f"\n{'─'*60}")
