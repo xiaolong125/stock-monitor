@@ -170,24 +170,34 @@ def detect_anomalies(data: dict, thresholds: dict, state: dict) -> list[str]:
     if change_pct is not None and change_pct != 0:
         limit_up = thresholds.get("near_limit_up", 9.0)
         limit_down = thresholds.get("near_limit_down", -9.0)
+        price_change_threshold = thresholds.get("price_change_pct", 3.0)
+        direction = "up" if change_pct > 0 else "down"
 
         # 涨跌停：始终提醒
         if change_pct >= limit_up:
             alerts.append(f"🚀 {name}({code}) 涨停 +{change_pct:.2f}% 现价{price:.2f}")
         elif change_pct <= limit_down:
             alerts.append(f"🔻 {name}({code}) 跌停 {change_pct:.2f}% 现价{price:.2f}")
-        elif abs(change_pct) >= thresholds.get("price_change_pct", 3.0):
-            # 大涨大跌：方向变了或重新进入才报
-            direction = "up" if change_pct > 0 else "down"
-            prev_direction = stock_state.get("last_alert_direction")
-            if prev_direction != direction:
+
+        # 方向翻转（由红转绿 / 由绿转红）：始终提醒，不受阈值限制
+        prev_direction = stock_state.get("last_direction")
+        if prev_direction is not None and prev_direction != direction:
+            label = "由红转绿 🔻" if direction == "down" else "由绿转红 🚀"
+            alerts.append(f"🔄 {name}({code}) {label} {change_pct:+.2f}% 现价{price:.2f}")
+            # 方向变了，同步重置阈值告警状态，让大涨大跌也能重新触发
+            stock_state.pop("last_alert_direction", None)
+        stock_state["last_direction"] = direction
+
+        # 大涨大跌：方向变化或重新进入阈值时才提醒
+        if abs(change_pct) >= price_change_threshold:
+            prev_alert_dir = stock_state.get("last_alert_direction")
+            if prev_alert_dir != direction:
                 label = "大涨" if direction == "up" else "大跌"
                 alerts.append(f"⚠️ {name}({code}) {label} {change_pct:+.2f}% 现价{price:.2f}")
                 stock_state["last_alert_direction"] = direction
         else:
-            # 回到阈值以下，重置方向记录
-            if "last_alert_direction" in stock_state:
-                del stock_state["last_alert_direction"]
+            # 回到阈值以下，重置告警方向，以便下次重新进入时提醒
+            stock_state.pop("last_alert_direction", None)
 
     # 振幅：只在创新高时提醒
     if amplitude is not None and amplitude >= thresholds.get("amplitude", 6.0):
