@@ -1,11 +1,10 @@
 # A 股盯盘工具
 
-纯标准库实现，通过新浪行情 API 获取实时数据。自动判断北京时间交易时段，异常时弹出 macOS 系统通知。
+纯标准库实现，通过新浪行情 API 获取实时数据。在 Claude Code 中运行，异常实时推送到对话中。
 
 ## 环境要求
 
 - Python 3.9+
-- macOS（通知功能依赖 `osascript`）
 
 ## 安装
 
@@ -50,21 +49,20 @@ source venv/bin/activate
 
 ## 使用
 
+在 Claude Code 中说"开始盯盘"，Claude 会自动启动后台轮询并实时推送异常：
+
+```
+开始盯盘
+```
+
+或手动运行：
+
 ```bash
 # 单次检查
 python3 stock_monitor.py
 
 # 持续盯盘（每分钟轮询）
 ./run.sh
-
-# 测试通知是否正常
-python3 stock_monitor.py --test
-
-# 禁止弹窗（仅终端输出）
-python3 stock_monitor.py --no-notify
-
-# 非交易时段也弹窗
-python3 stock_monitor.py --force-notify
 ```
 
 ## 提醒规则
@@ -76,8 +74,9 @@ python3 stock_monitor.py --force-notify
 | 大涨/大跌 | 涨跌幅超过阈值且方向变化 | 方向不变不重复 |
 | 振幅新高 | 当日振幅超过阈值且创新高 | 仅在新高时 |
 
-## 注意事项
+## 工作原理
 
-- **非交易时段**（盘前、午休、收盘后、周末）只展示数据不弹窗，避免打扰
-- 数据来源为新浪行情 API，有 15 分钟左右延迟属正常现象
-- 通知依赖 macOS `osascript`，非 macOS 系统仅终端输出
+- 通过新浪行情 API 获取实时数据
+- 自动判断北京时间交易时段（盘前/早盘/午休/午盘/收盘）
+- 非交易时段只展示数据不弹窗，避免打扰
+- 异常检测结果直接推送到 Claude Code 对话中
